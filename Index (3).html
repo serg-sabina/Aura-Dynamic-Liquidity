@@ -1,0 +1,135 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.28;
+
+contract AuraDynamicLiquidity {
+    struct LiquidityProvider {
+        uint256 ethSupplied;
+        uint256 feeCredits;
+        bool isActive;
+    }
+
+    address payable public immutable poolManager;
+    string public protocolTag;
+    uint256 public dynamicFeeBps; // 30 = 0.3%
+    uint256 public totalLiquidityETH;
+    uint256 public totalSwappedVolume;
+    uint256 public accumulatedPlatformFees;
+    bool public isPoolHalted;
+
+    mapping(address => LiquidityProvider) public providers;
+
+    event LiquiditySupplied(address indexed provider, uint256 amount);
+    event FeeTiersModified(uint256 newFeeBps);
+    event PlatformFeesHarvested(address indexed manager, uint256 amount);
+    event SwapExecuted(address indexed swapper, uint256 inputETH, uint256 feePaid, uint256 syntheticOut);
+    event LiquidityWithdrawn(address indexed provider, uint256 amount);
+    event ProtocolTagChanged(string newTag);
+    event PoolHaltSwitched(bool isHalted);
+
+    modifier onlyManager() {
+        require(msg.sender == poolManager, "AuraLiquidity: Access denied");
+        _;
+    }
+
+    modifier whenOperational() {
+        require(!isPoolHalted, "AuraLiquidity: Pool temporarily halted");
+        _;
+    }
+
+    constructor() {
+        poolManager = payable(msg.sender);
+        protocolTag = "Aura Base Dynamic Liquidity Engine v1";
+        dynamicFeeBps = 30; // 0.3%
+        isPoolHalted = false;
+    }
+
+    // 1. addLiquidity
+    function addLiquidity() external payable whenOperational {
+        require(msg.value > 0, "AuraLiquidity: Zero liquidity deposit");
+
+        LiquidityProvider storage lp = providers[msg.sender];
+        lp.ethSupplied += msg.value;
+        lp.isActive = true;
+        totalLiquidityETH += msg.value;
+
+        emit LiquiditySupplied(msg.sender, msg.value);
+    }
+
+    // 2. adjustFeeTiers
+    function adjustFeeTiers(uint256 newFeeBps) external onlyManager {
+        require(newFeeBps <= 300, "AuraLiquidity: Fee capped at 3%");
+        dynamicFeeBps = newFeeBps;
+        emit FeeTiersModified(newFeeBps);
+    }
+
+    // 3. emergencyDrainFees
+    function emergencyDrainFees() external onlyManager {
+        uint256 fees = accumulatedPlatformFees;
+        if (fees == 0 && address(this).balance > totalLiquidityETH) {
+            fees = address(this).balance - totalLiquidityETH;
+        }
+        require(fees > 0, "AuraLiquidity: Zero harvestable fees");
+
+        accumulatedPlatformFees = 0;
+        (bool sent, ) = poolManager.call{value: fees}("");
+        require(sent, "AuraLiquidity: Harvest transfer failed");
+
+        emit PlatformFeesHarvested(poolManager, fees);
+    }
+
+    // 4. executeSwapETHForSynthetic
+    function executeSwapETHForSynthetic(uint256 minSyntheticOutput) external payable whenOperational {
+        require(msg.value > 0, "AuraLiquidity: Input ETH must be positive");
+
+        uint256 fee = (msg.value * dynamicFeeBps) / 10000;
+        uint256 netInput = msg.value - fee;
+        uint256 syntheticOut = netInput * 2500; // Расчетный синтетический курс
+
+        require(syntheticOut >= minSyntheticOutput, "AuraLiquidity: Slippage limit breached");
+
+        accumulatedPlatformFees += fee;
+        totalSwappedVolume += msg.value;
+
+        // Возврат чистого ETH своперу (для ончейн-взаимодействия без потери средств)
+        (bool sent, ) = payable(msg.sender).call{value: netInput}("");
+        require(sent, "AuraLiquidity: Settlement return failed");
+
+        emit SwapExecuted(msg.sender, msg.value, fee, syntheticOut);
+    }
+
+    // 5. removeLiquidity
+    function removeLiquidity(uint256 amount) external {
+        LiquidityProvider storage lp = providers[msg.sender];
+        require(lp.isActive && lp.ethSupplied >= amount && amount > 0, "AuraLiquidity: Insufficient liquidity share");
+
+        lp.ethSupplied -= amount;
+        totalLiquidityETH -= amount;
+        if (lp.ethSupplied == 0) {
+            lp.isActive = false;
+        }
+
+        (bool sent, ) = payable(msg.sender).call{value: amount}("");
+        require(sent, "AuraLiquidity: Withdrawal failed");
+
+        emit LiquidityWithdrawn(msg.sender, amount);
+    }
+
+    // 6. setProtocolTag
+    function setProtocolTag(string calldata newTag) external onlyManager {
+        require(bytes(newTag).length > 0, "AuraLiquidity: Empty tag string");
+        protocolTag = newTag;
+        emit ProtocolTagChanged(newTag);
+    }
+
+    // 7. togglePoolHalt
+    function togglePoolHalt(bool isHalted) external onlyManager {
+        isPoolHalted = isHalted;
+        emit PoolHaltSwitched(isHalted);
+    }
+
+    // Чтение информации о провайдере
+    function getProviderInfo(address account) external view returns (uint256 suppliedETH, bool active) {
+        LiquidityProvider memory lp = providers[account];
+        return (lp.ethSupplied, lp.isActive);
+    }
+}
